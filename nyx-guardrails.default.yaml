@@ -1,8 +1,9 @@
 # nyx-guardrails configuration
 # Copy to nyx-guardrails.yaml and customize
 
-# Target LLM API
-target: "https://api.openai.com"
+# Default upstream provider target (used as a fallback)
+# OpenRouter users should keep this set to OpenRouter.
+target: "https://openrouter.ai/api/v1"
 
 # Proxy settings
 bind: "127.0.0.1"

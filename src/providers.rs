@@ -46,7 +46,7 @@ pub static PROVIDERS: &[Provider] = &[
     Provider { name: "AWS Bedrock",    prefix: "/bedrock",      upstream: "https://bedrock-runtime.us-east-1.amazonaws.com" },
 
     // AI coding / agent platforms
-    Provider { name: "OpenRouter",     prefix: "/openrouter",   upstream: "https://openrouter.ai" },
+    Provider { name: "OpenRouter",     prefix: "/openrouter",   upstream: "https://openrouter.ai/api" },
     Provider { name: "xAI / Grok",     prefix: "/xai",          upstream: "https://api.x.ai" },
 ];
 

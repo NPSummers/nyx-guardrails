@@ -3,7 +3,6 @@ mod config;
 mod faker;
 mod injection;
 mod patterns;
-mod plugin;
 mod providers;
 mod proxy;
 mod redactor;
@@ -26,19 +25,39 @@ use tracing::error;
 
 use audit::AuditLog;
 use config::Config;
-use plugin::PluginState;
 use proxy::{handle_request, ProxyState};
 use session::SessionManager;
 use stats::Stats;
 use vault::Vault;
+
+fn build_http_client() -> Result<Client, reqwest::Error> {
+    let backend = std::env::var("NYX_TLS_BACKEND")
+        .unwrap_or_else(|_| "native".to_string())
+        .trim()
+        .to_ascii_lowercase();
+
+    let mut builder = Client::builder()
+        .http1_only();
+
+    if backend == "rustls" {
+        eprintln!("  tls:     rustls");
+        builder = builder.use_rustls_tls();
+    } else {
+        eprintln!("  tls:     native-tls");
+        builder = builder.use_native_tls();
+    }
+
+    builder.build()
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "nyx-guardrails",
     version,
     about = "Invisible sensitive data filter for LLM APIs",
-    long_about = "Mirage sits between your LLM client and provider, silently replacing \
+    long_about = "Nyx-Guardrails sits between your LLM client and provider, silently replacing \
     secrets, credentials, and sensitive data with plausible fakes. The LLM never knows. \
+    It also detects and blocks prompt injection attempts. \
     Sub-millisecond overhead."
 )]
 struct Args {
@@ -150,7 +169,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if args.setup {
-        return setup_interactive(args.port.unwrap_or(8686), args.yes, args.dry_run, args.sensitivity.as_deref());
+        return setup_interactive(
+            args.port.unwrap_or(8686),
+            args.yes,
+            args.dry_run,
+            args.sensitivity.as_deref(),
+        );
     }
     if args.uninstall {
         return uninstall_all();
@@ -221,17 +245,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let stats = Stats::new();
 
+    let client = build_http_client()?;
+
     let state = Arc::new(ProxyState {
-        client: Client::new(),
+        client,
         sessions: SessionManager::new(vault.clone()),
         config: cfg.clone(),
         audit_log,
         stats: stats.clone(),
         seen_pii: Mutex::new(HashSet::new()),
         tainted_sessions: Mutex::new(HashSet::new()),
-        plugin_state: Mutex::new(PluginState::new(
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        )),
     });
 
     let addr: SocketAddr = format!("{}:{}", cfg.bind, cfg.port).parse()?;
@@ -376,19 +399,31 @@ const WRAPPER_TOOLS: &[WrapperTool] = &[
 fn find_tool_in_path(name: &str, skip_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            if dir == skip_dir { continue; }
+            if dir == skip_dir {
+                continue;
+            }
             let candidate = dir.join(name);
-            if candidate.exists() { return Some(candidate); }
-            #[cfg(windows)] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
                 let exe = dir.join(format!("{}.exe", name));
-                if exe.exists() { return Some(exe); }
+                if exe.exists() {
+                    return Some(exe);
+                }
             }
         }
     }
     None
 }
 
-fn setup_interactive(port: u16, assume_yes: bool, dry_run: bool, sensitivity: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn setup_interactive(
+    port: u16,
+    assume_yes: bool,
+    dry_run: bool,
+    sensitivity: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::io::{IsTerminal, Write};
     let bin_dir = nyx_guardrails_dir().join("bin");
 
@@ -398,13 +433,21 @@ fn setup_interactive(port: u16, assume_yes: bool, dry_run: bool, sensitivity: Op
     eprintln!("  Scanning for installed LLM tools...");
     eprintln!();
 
-    let found: Vec<&WrapperTool> = WRAPPER_TOOLS.iter()
+    let found: Vec<&WrapperTool> = WRAPPER_TOOLS
+        .iter()
         .filter(|t| find_tool_in_path(t.name, &bin_dir).is_some())
         .collect();
 
     if found.is_empty() {
         eprintln!("  No supported tools found in PATH.");
-        eprintln!("  Supported: {}", WRAPPER_TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
+        eprintln!(
+            "  Supported: {}",
+            WRAPPER_TOOLS
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         eprintln!();
         return Ok(());
     }
@@ -431,7 +474,9 @@ fn setup_interactive(port: u16, assume_yes: bool, dry_run: bool, sensitivity: Op
             let mut sel = Vec::new();
             for part in input.split(',') {
                 if let Ok(n) = part.trim().parse::<usize>() {
-                    if n >= 1 && n <= found.len() { sel.push(&found[n - 1]); }
+                    if n >= 1 && n <= found.len() {
+                        sel.push(&found[n - 1]);
+                    }
                 }
             }
             if sel.is_empty() {
@@ -449,12 +494,19 @@ fn setup_interactive(port: u16, assume_yes: bool, dry_run: bool, sensitivity: Op
     let mut installed_names: Vec<String> = Vec::new();
 
     for tool in &selected {
-        let wrapper_path = if cfg!(windows) { bin_dir.join(format!("{}.cmd", tool.name)) }
-                           else { bin_dir.join(tool.name) };
-        let script = if cfg!(windows) { generate_windows_wrapper(tool, port) }
-                     else { generate_unix_wrapper(tool, port) };
+        let wrapper_path = if cfg!(windows) {
+            bin_dir.join(format!("{}.cmd", tool.name))
+        } else {
+            bin_dir.join(tool.name)
+        };
+        let script = if cfg!(windows) {
+            generate_windows_wrapper(tool, port)
+        } else {
+            generate_unix_wrapper(tool, port)
+        };
         std::fs::write(&wrapper_path, &script)?;
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let mut p = std::fs::metadata(&wrapper_path)?.permissions();
             p.set_mode(0o755);
@@ -462,10 +514,14 @@ fn setup_interactive(port: u16, assume_yes: bool, dry_run: bool, sensitivity: Op
         }
 
         // -direct bypass
-        let direct_path = if cfg!(windows) { bin_dir.join(format!("{}-direct.cmd", tool.name)) }
-                          else { bin_dir.join(format!("{}-direct", tool.name)) };
+        let direct_path = if cfg!(windows) {
+            bin_dir.join(format!("{}-direct.cmd", tool.name))
+        } else {
+            bin_dir.join(format!("{}-direct", tool.name))
+        };
         std::fs::write(&direct_path, generate_direct_wrapper(tool.name))?;
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let mut p = std::fs::metadata(&direct_path)?.permissions();
             p.set_mode(0o755);
@@ -509,7 +565,10 @@ fn setup_interactive(port: u16, assume_yes: bool, dry_run: bool, sensitivity: Op
     eprintln!();
     for name in &installed_names {
         eprintln!("    {}           → filtered through nyx-guardrails", name);
-        eprintln!("    {}-direct    → bypasses nyx-guardrails completely", name);
+        eprintln!(
+            "    {}-direct    → bypasses nyx-guardrails completely",
+            name
+        );
     }
     eprintln!();
     eprintln!("  The daemon runs automatically in the background.");
@@ -536,8 +595,12 @@ fn uninstall_all() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 removed += 1;
             }
         }
-        if removed == 0 { eprintln!("  (no wrapper scripts found)"); }
-        if std::fs::read_dir(&bin_dir)?.next().is_none() { std::fs::remove_dir(&bin_dir)?; }
+        if removed == 0 {
+            eprintln!("  (no wrapper scripts found)");
+        }
+        if std::fs::read_dir(&bin_dir)?.next().is_none() {
+            std::fs::remove_dir(&bin_dir)?;
+        }
     } else {
         eprintln!("  (no wrapper directory found)");
     }
@@ -545,8 +608,18 @@ fn uninstall_all() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::net::TcpStream::connect("127.0.0.1:8686").is_ok() {
         eprintln!();
         eprintln!("  Stopping daemon...");
-        #[cfg(unix)] { let _ = std::process::Command::new("pkill").args(["-f", "nyx-guardrails"]).output(); }
-        #[cfg(windows)] { let _ = std::process::Command::new("taskkill").args(["/IM", "nyx-guardrails.exe", "/F"]).output(); }
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "nyx-guardrails"])
+                .output();
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/IM", "nyx-guardrails.exe", "/F"])
+                .output();
+        }
         eprintln!("  ✓ Daemon stopped");
     }
 
@@ -562,7 +635,8 @@ fn generate_direct_wrapper(name: &str) -> String {
     if cfg!(windows) {
         format!("@echo off\r\nrem {n}-direct: bypass nyx-guardrails\r\nfor /f \"tokens=*\" %%i in ('where {n} 2^>nul') do (\r\n    echo %%i | findstr /i /c:\".nyx-guardrails\\bin\" >nul || ( %%i %* & exit /b %errorlevel% )\r\n)\r\necho could not find real '{n}' 1>&2\r\nexit /b 127\r\n", n = name)
     } else {
-        format!(r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 # {n}-direct: run {n} without nyx-guardrails
 WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
 REAL=""; OLDIFS="$IFS"; IFS=:
@@ -573,7 +647,9 @@ done
 IFS="$OLDIFS"
 [ -z "$REAL" ] && {{ echo "could not find real '{n}' in PATH" >&2; exit 127; }}
 exec "$REAL" "$@"
-"#, n = name)
+"#,
+            n = name
+        )
     }
 }
 
@@ -633,10 +709,7 @@ fn wrapper_install(port: u16) -> Result<(), Box<dyn std::error::Error + Send + S
         );
         eprintln!("    # Or add permanently via System > Environment Variables");
     } else {
-        eprintln!(
-            "    export PATH=\"{}:$PATH\"",
-            bin_dir.display()
-        );
+        eprintln!("    export PATH=\"{}:$PATH\"", bin_dir.display());
         eprintln!("    # Add that line to ~/.zshrc or ~/.bashrc to persist");
     }
     eprintln!();
@@ -840,7 +913,10 @@ fn service_install(args: &Args) -> Result<(), Box<dyn std::error::Error + Send +
         eprintln!();
         eprintln!("  Rollback options:");
         eprintln!("    nyx-guardrails --service-uninstall");
-        eprintln!("    or restore backups from {}", nyx_guardrails_home.join("backups").display());
+        eprintln!(
+            "    or restore backups from {}",
+            nyx_guardrails_home.join("backups").display()
+        );
     }
 
     // Show live tail of detections
@@ -1003,9 +1079,7 @@ fn install_daemon(
     extra_args: &[String],
     nyx_guardrails_home: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let unit_dir = dirs_next::home_dir()
-        .unwrap()
-        .join(".config/systemd/user");
+    let unit_dir = dirs_next::home_dir().unwrap().join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join("nyx-guardrails.service");
 
@@ -1541,7 +1615,10 @@ fn install_shell(
                 eprintln!("    backup: {}", backup.display());
             }
         } else {
-            eprintln!("  ✓ Shell integration already up-to-date in {}", result.path.display());
+            eprintln!(
+                "  ✓ Shell integration already up-to-date in {}",
+                result.path.display()
+            );
         }
         results.push(result);
     }
@@ -1699,7 +1776,9 @@ fn remove_block(contents: &str, marker_start: &str, marker_end: &str) -> String 
 
 // ─── Live log tail (first-time experience) ────────────────────────────
 
-fn tail_log(nyx_guardrails_home: &std::path::Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn tail_log(
+    nyx_guardrails_home: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let log_path = nyx_guardrails_home.join("nyx-guardrails.log");
 
     // Wait for log file to appear

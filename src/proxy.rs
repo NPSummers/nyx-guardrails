@@ -14,7 +14,6 @@ use crate::audit::AuditLog;
 use crate::config::{Config, RedactAction};
 use crate::faker::Faker;
 use crate::injection::scan_prompt_injection;
-use crate::plugin::PluginState;
 use crate::redactor::detect;
 use crate::session::SessionManager;
 use crate::stats::Stats;
@@ -64,11 +63,23 @@ pub struct ProxyState {
     pub seen_pii: Mutex<HashSet<String>>,
     /// Sessions flagged for prompt injection risk
     pub tainted_sessions: Mutex<HashSet<String>>,
-    /// OpenClaw plugin runtime state
-    pub plugin_state: Mutex<PluginState>,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+const OPENROUTER_ALLOWED_HEADERS: &[&str] = &[
+    "authorization",
+    "content-type",
+    "accept",
+    "accept-language",
+    "content-encoding",
+    "http-referer",
+    "x-title",
+    "user-agent",
+    "openrouter-organization",
+    "openrouter-project",
+    "openrouter-beta",
+];
 
 fn full_body(data: Bytes) -> BoxBody {
     Full::new(data)
@@ -102,93 +113,26 @@ fn health_response(state: &ProxyState) -> Response<BoxBody> {
         .unwrap()
 }
 
-fn command_response(msg: &str) -> Response<BoxBody> {
-    let body = serde_json::json!({
-        "id": format!("ngr_cmd_{}", uuid::Uuid::new_v4().simple()),
-        "object": "chat.completion",
-        "created": chrono::Utc::now().timestamp(),
-        "model": "nyx-guardrails-plugin",
-        "choices": [{
-            "index": 0,
-            "message": { "role": "assistant", "content": msg },
-            "finish_reason": "stop"
-        }]
-    });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(full_body(Bytes::from(body.to_string())))
-        .unwrap()
-}
-
-fn unauthorized_response(msg: &str) -> Response<BoxBody> {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(full_body(Bytes::from(msg.to_string())))
-        .unwrap()
-}
-
-fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(full_body(Bytes::from(value.to_string())))
-        .unwrap()
-}
-
-fn query_param(uri: &hyper::Uri, key: &str) -> Option<String> {
-    let query = uri.query()?;
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        let k = parts.next().unwrap_or_default();
-        let v = parts.next().unwrap_or_default();
-        if k == key {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
-fn extract_user_text(json: &Value) -> Option<String> {
-    if let Some(messages) = json.get("messages").and_then(|v| v.as_array()) {
-        for m in messages.iter().rev() {
-            if m.get("role").and_then(|r| r.as_str()) == Some("user") {
-                if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-                    return Some(content.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(prompt) = json.get("prompt").and_then(|p| p.as_str()) {
-        return Some(prompt.to_string());
-    }
-    if let Some(input) = json.get("input").and_then(|p| p.as_str()) {
-        return Some(input.to_string());
-    }
-    None
-}
-
-fn extract_command_from_raw(body: &str) -> Option<String> {
-    if body.contains("/ngr_dashboard") {
-        return Some("/ngr_dashboard".to_string());
-    }
-    for arg in ["on", "off", "none"] {
-        let needle = format!("/ngr_sanitize {}", arg);
-        if body.contains(&needle) {
-            return Some(needle);
-        }
-    }
-    None
-}
-
 fn truncate_for_audit(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
     } else {
         format!("{}…", &text[..max_len])
     }
+}
+
+fn is_openrouter_target(target_url: &str) -> bool {
+    target_url.contains("openrouter.ai")
+}
+
+fn should_forward_header(name_lc: &str, strict_openrouter: bool) -> bool {
+    if strict_openrouter {
+        return OPENROUTER_ALLOWED_HEADERS.iter().any(|h| *h == name_lc);
+    }
+    !matches!(
+        name_lc,
+        "host" | "connection" | "transfer-encoding" | "content-length" | "accept-encoding"
+    )
 }
 
 fn mark_session_tainted(state: &ProxyState, session_id: &str) {
@@ -205,16 +149,6 @@ fn report_prompt_injection(
     reason: &str,
 ) {
     mark_session_tainted(state, session_id);
-    {
-        let mut plugin = state.plugin_state.lock().unwrap();
-        plugin.push_event(
-            "warn",
-            format!(
-                "prompt injection {} score={:.2} session={} ({})",
-                source, score, session_id, reason
-            ),
-        );
-    }
     let excerpt = truncate_for_audit(input, 180);
     eprint!(
         "\r\x1b[2K  🚨 PROMPT_INJECTION {} score={:.2} session={} ({})\n",
@@ -295,17 +229,40 @@ async fn forward_request(
     debug!("▶ fast-forward {} {} → {} ({} bytes, no inspection)", method, path, target_url, body.len());
 
     let mut forward = state.client.request(method.clone(), &target_url);
+    let strict_openrouter_headers = is_openrouter_target(&target_url);
+    let mut has_user_agent = false;
+    let mut has_http_referer = false;
+    let mut has_x_title = false;
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
-        match name_str.as_str() {
-            "host" | "connection" | "transfer-encoding" | "content-length" | "accept-encoding" => continue,
-            _ => {
-                if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                    if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_ref()) {
-                        forward = forward.header(n, v);
-                    }
-                }
+        if !should_forward_header(&name_str, strict_openrouter_headers) {
+            continue;
+        }
+        if name_str == "user-agent" {
+            has_user_agent = true;
+        } else if name_str == "http-referer" {
+            has_http_referer = true;
+        } else if name_str == "x-title" {
+            has_x_title = true;
+        }
+        if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+            if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_ref()) {
+                forward = forward.header(n, v);
             }
+        }
+    }
+    if strict_openrouter_headers {
+        if !has_user_agent {
+            forward = forward.header(
+                "user-agent",
+                format!("nyx-guardrails/{}", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        if !has_http_referer {
+            forward = forward.header("http-referer", "https://github.com/chandika/nyx-guardrails");
+        }
+        if !has_x_title {
+            forward = forward.header("x-title", "nyx-guardrails");
         }
     }
     // Force identity encoding so response rehydration can operate safely on plain text/JSON.
@@ -316,8 +273,6 @@ async fn forward_request(
         Ok(resp) => resp,
         Err(e) => {
             warn!("Upstream request failed: {}", e);
-            let mut plugin = state.plugin_state.lock().unwrap();
-            plugin.push_event("error", format!("upstream request failed: {}", e));
             return Ok(error_response(StatusCode::BAD_GATEWAY, &format!("Upstream error: {}", e)));
         }
     };
@@ -345,73 +300,11 @@ pub async fn handle_request(
     state: Arc<ProxyState>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let method = req.method().clone();
-    let uri = req.uri().clone();
     let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
     let headers = req.headers().clone();
 
     if path == "/healthz" {
         return Ok(health_response(&state));
-    }
-    if uri.path() == "/ngr/dashboard" {
-        let token = query_param(&uri, "token").unwrap_or_default();
-        let mut plugin = state.plugin_state.lock().unwrap();
-        if token != plugin.dashboard_token {
-            return Ok(unauthorized_response("invalid dashboard token"));
-        }
-        plugin.run_file_scan();
-        let html = plugin.render_dashboard_html();
-        return Ok(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/html; charset=utf-8")
-                .body(full_body(Bytes::from(html)))
-                .unwrap(),
-        );
-    }
-    if uri.path() == "/ngr/admin/status" {
-        let plugin = state.plugin_state.lock().unwrap();
-        return Ok(json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "sanitize_enabled": plugin.sanitize_enabled,
-                "dashboard_token": plugin.dashboard_token,
-                "warnings": plugin.warnings.len(),
-                "last_scan_at": plugin.last_scan_at,
-            }),
-        ));
-    }
-    if uri.path() == "/ngr/admin/dashboard-token" {
-        let plugin = state.plugin_state.lock().unwrap();
-        return Ok(json_response(
-            StatusCode::OK,
-            serde_json::json!({ "token": plugin.dashboard_token }),
-        ));
-    }
-    if uri.path() == "/ngr/admin/sanitize" {
-        let mode = query_param(&uri, "mode").unwrap_or_else(|| "none".to_string());
-        let mut plugin = state.plugin_state.lock().unwrap();
-        let result = plugin.handle_ngr_sanitize(&mode);
-        return Ok(json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "ok": true,
-                "mode": mode,
-                "message": result,
-                "sanitize_enabled": plugin.sanitize_enabled
-            }),
-        ));
-    }
-    if uri.path() == "/ngr/admin/file-scan" {
-        let mut plugin = state.plugin_state.lock().unwrap();
-        plugin.run_file_scan();
-        return Ok(json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "ok": true,
-                "warnings": plugin.warnings.len(),
-                "last_scan_at": plugin.last_scan_at
-            }),
-        ));
     }
 
     debug!("{} {}", method, path);
@@ -502,60 +395,8 @@ pub async fn handle_request(
     } else {
         serde_json::from_slice::<Value>(&inspect_bytes).ok()
     };
-    if let Some(command) = extract_command_from_raw(&String::from_utf8_lossy(&inspect_bytes)) {
-        if let Some(rest) = command.strip_prefix("/ngr_sanitize") {
-            let mut plugin = state.plugin_state.lock().unwrap();
-            let result = plugin.handle_ngr_sanitize(rest.trim());
-            return Ok(command_response(&result));
-        }
-        if command == "/ngr_dashboard" {
-            let mut plugin = state.plugin_state.lock().unwrap();
-            plugin.run_file_scan();
-            let result = plugin.dashboard_command_output(state.config.port);
-            return Ok(command_response(&result));
-        }
-    }
     if let Some(ref json) = parsed_json {
         session_id = SessionManager::derive_session_id(json);
-    }
-
-    // OpenClaw plugin command channel via normal chat input:
-    // /ngr_sanitize <on|off|none>
-    // /ngr_dashboard
-    if let Some(ref json) = parsed_json {
-        if let Some(user_text) = extract_user_text(json) {
-        let trimmed = user_text.trim();
-        if let Some(rest) = trimmed.strip_prefix("/ngr_sanitize") {
-            let arg = rest.trim().to_ascii_lowercase();
-            let mut plugin = state.plugin_state.lock().unwrap();
-            let result = plugin.handle_ngr_sanitize(arg.as_str());
-            return Ok(command_response(&result));
-        }
-        if trimmed == "/ngr_dashboard" {
-            let mut plugin = state.plugin_state.lock().unwrap();
-            plugin.run_file_scan();
-            let result = plugin.dashboard_command_output(state.config.port);
-            return Ok(command_response(&result));
-        }
-        }
-    }
-
-    let sanitize_enabled = {
-        let plugin = state.plugin_state.lock().unwrap();
-        plugin.sanitize_enabled
-    };
-    if !sanitize_enabled {
-        let (_, faker) = state.sessions.get_faker(&session_id);
-        return forward_request(
-            method,
-            &path,
-            &headers,
-            body_bytes.to_vec(),
-            &session_id,
-            state,
-            faker,
-        )
-        .await;
     }
     let mut request_alert: Option<String> = None;
 
@@ -664,30 +505,58 @@ pub async fn handle_request(
     debug!("  forward body: {} bytes (compressed: {})", forward_body.len(), is_compressed);
 
     let mut forward = state.client.request(method.clone(), &target_url);
+    let strict_openrouter_headers = is_openrouter_target(&target_url);
+    let mut has_user_agent = false;
+    let mut has_http_referer = false;
+    let mut has_x_title = false;
 
     let mut forwarded_headers = Vec::new();
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
-        match name_str.as_str() {
-            "host" | "connection" | "transfer-encoding" | "content-length" | "accept-encoding" => {
-                debug!("  ⊘ skipping header: {}", name_str);
-                continue;
-            }
-            _ => {
-                if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                    if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_ref()) {
-                        forwarded_headers.push(format!("{}: {}", name_str,
-                            if name_str == "authorization" || name_str == "x-api-key" {
-                                let val = value.to_str().unwrap_or("***");
-                                if val.len() > 12 { format!("{}...{}", &val[..8], &val[val.len()-4..]) } else { "***".to_string() }
-                            } else {
-                                value.to_str().unwrap_or("<binary>").to_string()
-                            }
-                        ));
-                        forward = forward.header(n, v);
+        if !should_forward_header(&name_str, strict_openrouter_headers) {
+            debug!("  ⊘ skipping header: {}", name_str);
+            continue;
+        }
+        if name_str == "user-agent" {
+            has_user_agent = true;
+        } else if name_str == "http-referer" {
+            has_http_referer = true;
+        } else if name_str == "x-title" {
+            has_x_title = true;
+        }
+        if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+            if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_ref()) {
+                forwarded_headers.push(format!(
+                    "{}: {}",
+                    name_str,
+                    if name_str == "authorization" || name_str == "x-api-key" {
+                        let val = value.to_str().unwrap_or("***");
+                        if val.len() > 12 {
+                            format!("{}...{}", &val[..8], &val[val.len() - 4..])
+                        } else {
+                            "***".to_string()
+                        }
+                    } else {
+                        value.to_str().unwrap_or("<binary>").to_string()
                     }
-                }
+                ));
+                forward = forward.header(n, v);
             }
+        }
+    }
+    if strict_openrouter_headers {
+        if !has_user_agent {
+            let ua = format!("nyx-guardrails/{}", env!("CARGO_PKG_VERSION"));
+            forwarded_headers.push(format!("user-agent: {}", ua));
+            forward = forward.header("user-agent", ua);
+        }
+        if !has_http_referer {
+            forwarded_headers.push("http-referer: https://github.com/chandika/nyx-guardrails".to_string());
+            forward = forward.header("http-referer", "https://github.com/chandika/nyx-guardrails");
+        }
+        if !has_x_title {
+            forwarded_headers.push("x-title: nyx-guardrails".to_string());
+            forward = forward.header("x-title", "nyx-guardrails");
         }
     }
     for h in &forwarded_headers {
@@ -703,8 +572,6 @@ pub async fn handle_request(
         Ok(resp) => resp,
         Err(e) => {
             warn!("Upstream request failed: {}", e);
-            let mut plugin = state.plugin_state.lock().unwrap();
-            plugin.push_event("error", format!("upstream request failed: {}", e));
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("Upstream request failed: {}", e),
@@ -1128,8 +995,6 @@ async fn handle_streaming_response(
                 }
                 Err(e) => {
                     warn!("Stream chunk error: {}", e);
-                    let mut plugin = state.plugin_state.lock().unwrap();
-                    plugin.push_event("error", format!("stream chunk error: {}", e));
                     break;
                 }
             }
