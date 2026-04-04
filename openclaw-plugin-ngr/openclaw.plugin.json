@@ -1,0 +1,23 @@
+{
+  "id": "nyx-guardrails-plugin",
+  "name": "Nyx Guardrails Plugin",
+  "description": "OpenClaw commands for Nyx Guardrails sanitize toggle and dashboard",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "nyxBaseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8686"
+      },
+      "originalOpenrouterBaseUrl": {
+        "type": "string",
+        "default": "https://openrouter.ai/api/v1"
+      },
+      "sanitizedOpenrouterBaseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8686/openrouter"
+      }
+    }
+  }
+}

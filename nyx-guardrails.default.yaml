@@ -1,0 +1,172 @@
+# nyx-guardrails configuration
+# Copy to nyx-guardrails.yaml and customize
+
+# Target LLM API
+target: "https://api.openai.com"
+
+# Proxy settings
+bind: "127.0.0.1"
+port: 8686
+
+# Sensitivity: low | medium | high | paranoid
+# low: only always_redact categories
+# medium: always_redact + mask categories (default)
+# high: always_redact + mask + warn categories
+# paranoid: redact everything detected
+sensitivity: medium
+
+# Categories and their actions
+rules:
+  # Always redact — LLM never needs the real value
+  always_redact:
+    - SSN
+    - CREDIT_CARD
+    - PRIVATE_KEY
+    - AWS_KEY
+    - GITHUB_TOKEN
+    - API_KEY
+    - BEARER_TOKEN
+    - CONNECTION_STRING
+    - SECRET
+
+  # Redact with plausible fakes — preserves semantic role
+  mask:
+    - EMAIL
+    - PHONE
+
+  # Log warning but don't redact
+  warn_only:
+    - IP_ADDRESS
+
+# Code blocks: don't redact inside ``` fenced blocks
+code_block_passthrough: false
+
+# Allowlist: never redact these values (globs supported)
+allowlist: []
+  # - "192.168.1.*"
+  # - "*@company.com"
+  # - "sk-test-*"
+
+# Blocklist: always redact these (overrides allowlist)
+blocklist: []
+  # - "*@personal.com"
+
+# Prompt-injection and exfiltration defense for all proxied AI APIs
+# (OpenClaw sessions included; not Claude-only)
+anti_prompt_injection:
+  enabled: true
+  fail_closed: true                 # if uncertain, treat as unsafe
+
+  # Primary classifier model (HF)
+  model:
+    repository: "rogue-security/prompt-injection-jailbreak-sentinel-v2"
+    label_injection: "prompt_injection"
+    label_safe: "safe"
+    requires_hf_auth: true
+    hf_token_env: "HF_TOKEN"
+    hf_token_path_env: "HF_TOKEN_PATH"
+
+  # ML classifier controls (0.0-1.0)
+  threshold: 0.70                   # general text threshold
+  claude_md_threshold: 0.90         # higher for instruction-heavy docs
+  scan_mode: fast                   # fast | full | custom
+
+  # Model limitation + language bridge:
+  # this model is strongest on English prompts.
+  translation:
+    enabled: true
+    only_if_non_english: true
+    source_language: auto
+    target_language: en
+    provider: google_translate_unofficial
+    timeout_ms: 8000
+    fail_open_keep_original: true   # if translation fails, scan original text
+
+  # Fallback rules when model load/auth fails
+  fallback_heuristic:
+    enabled: true
+    base_score: 0.55
+    per_marker_bonus: 0.10
+    max_score: 0.99
+    safe_score: 0.92
+    suspicious_markers:
+      - "ignore all previous instructions"
+      - "ignore previous instructions"
+      - "disregard any prior constraints"
+      - "forget all safety rules"
+      - "developer mode"
+      - "system prompt"
+      - "/etc/passwd"
+      - "jailbreak"
+      - "override"
+
+  # Detection layers (run as an OR ensemble)
+  detect:
+    unicode_tricks: true            # invisibles, homoglyphs, bidi overrides
+    known_injection_phrases: true   # substring matching for known attack text
+    ml_classifier: true             # prompt-injection classifier
+    secrets_in_content: true        # credential regex detection in content
+    bash_exfiltration: true         # source/sink checks in shell commands
+    script_exfiltration: true       # source/sink checks in script outputs
+
+  # Long-text strategy used by the classifier
+  chunking:
+    max_chars: 256
+    overlap_chars: 25
+    strategy: head_tail             # preserve start/end context on long inputs
+
+  # Hook-like behavior controls
+  behavior:
+    scan_input_content: true        # request/tool input
+    scan_output_content: true       # model/tool output
+    auto_taint_on_detection: true   # mark session/repo as tainted on hit
+
+  # Custom model list for scan_mode=custom
+  custom_models:
+    path: "~/.config/nyx-guardrails/models.toml"
+    # Example format:
+    # [[models]]
+    # repo = "ProtectAI/deberta-v3-small-prompt-injection-v2"
+    # threshold = 0.70
+    # [[models]]
+    # repo = "meta-llama/Llama-Prompt-Guard-2-86M"
+    # threshold = 0.70
+
+# Optional per-project monitoring/consent flow (Parry-style)
+project_monitoring:
+  ask_on_new_project: false
+  ignore_dirs: []                   # comma-like list of parent dirs to skip entirely
+  runtime_dir: "~/.nyx-guardrails"
+  repo_state_db: "repo-state.redb"
+
+  scan_cache:
+    enabled: true
+    path: "~/.nyx-guardrails/scan-cache.redb"
+    ttl_days: 30
+    prune_interval_minutes: 60
+
+# Optional anti-exfiltration tuning
+anti_exfiltration:
+  enabled: true
+  detect_dns_tunneling: true
+  detect_obfuscation:
+    - base64
+    - hex
+    - rot13
+  sensitive_path_overrides: []      # add local high-sensitivity paths
+  blocked_domain_overrides: []      # add high-risk exfil domains
+
+# Audit log
+audit:
+  enabled: true
+  path: "./nyx-guardrails-audit.jsonl"
+  # Log original values (WARNING: defeats the purpose if log is compromised)
+  log_values: false
+
+# Dry run: log what would be redacted without actually redacting
+dry_run: false
+
+# Check GitHub releases for newer nyx-guardrails versions at startup
+update_check:
+  enabled: true
+  timeout_ms: 1200      # network timeout (check runs in background)

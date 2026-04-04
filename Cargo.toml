@@ -1,0 +1,48 @@
+[package]
+name = "nyx-guardrails"
+version = "0.8.1"
+edition = "2021"
+description = "Invisible sensitive data filter for LLM APIs — secrets, credentials, and PII replaced with plausible fakes"
+license = "MIT"
+repository = "https://github.com/chandika/nyx-guardrails"
+keywords = ["security", "privacy", "llm", "proxy", "secrets"]
+categories = ["command-line-utilities", "web-programming"]
+exclude = [
+  "assets/*",
+  "target/*",
+  "docs/*",
+  "release-workflow.yml"
+]
+
+[dependencies]
+zstd = "0.13"
+flate2 = "1"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+once_cell = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+futures-util = "0.3"
+tokio-stream = "0.1"
+serde_yaml = "0.9"
+dirs-next = "2"
+chrono = { version = "0.4", features = ["serde"] }
+md5 = "0.7"
+aes-gcm = "0.10"
+sha2 = "0.10"
+argon2 = "0.5"
+ctrlc = "3.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
