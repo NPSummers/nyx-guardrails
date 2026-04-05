@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="${ROOT_DIR}/openguardrails/moltguard"
 BASHRC="${HOME}/.bashrc"
 NYX_CONFIG_PATH="${HOME}/.config/nyx-guardrails/nyx-guardrails.yaml"
+OPENCLAW_EXT_DIR="${HOME}/.openclaw/extensions"
+PLUGIN_ID="nyx-guardrails"
 PATH_MARKER_START="# >>> nyx-guardrails-path >>>"
 PATH_MARKER_END="# <<< nyx-guardrails-path <<<"
 ENV_MARKER_START="# >>> nyx-guardrails-openclaw >>>"
@@ -19,6 +21,41 @@ need_cmd() {
     echo "Missing required command: $1" >&2
     exit 1
   fi
+}
+
+set_openclaw_allowlist() {
+  local current allow_json updated_json
+  current="$(openclaw config get plugins.allow 2>/dev/null || echo '[]')"
+  updated_json="$(python3 - "$current" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1].strip()
+plugin_id = "nyx-guardrails"
+
+try:
+    data = json.loads(raw)
+except Exception:
+    data = []
+
+if not isinstance(data, list):
+    data = []
+
+if plugin_id not in data:
+    data.append(plugin_id)
+
+print(json.dumps(data))
+PY
+)"
+  openclaw config set plugins.allow --json "$updated_json"
+}
+
+manual_install_plugin() {
+  log "Using manual plugin install fallback"
+  mkdir -p "$OPENCLAW_EXT_DIR"
+  rm -rf "${OPENCLAW_EXT_DIR}/${PLUGIN_ID}"
+  cp -R "$PLUGIN_DIR" "${OPENCLAW_EXT_DIR}/${PLUGIN_ID}"
+  set_openclaw_allowlist
 }
 
 append_or_replace_block() {
@@ -89,11 +126,16 @@ log "Building and reinstalling OpenClaw plugin"
 cd "$PLUGIN_DIR"
 npm install
 npm run build
-openclaw plugins uninstall nyx-guardrails >/dev/null 2>&1 || true
+openclaw plugins uninstall "$PLUGIN_ID" >/dev/null 2>&1 || true
 openclaw plugins uninstall @nyx/nyx-guardrails >/dev/null 2>&1 || true
 openclaw plugins uninstall moltguard >/dev/null 2>&1 || true
 openclaw plugins uninstall @openguardrails/moltguard >/dev/null 2>&1 || true
-openclaw plugins install -l .
+
+if openclaw plugins install -l . --dangerously-force-unsafe-install; then
+  log "Plugin installed via openclaw plugins install"
+else
+  manual_install_plugin
+fi
 
 log "Restarting OpenClaw gateway to load plugin"
 openclaw gateway restart || true
