@@ -3,7 +3,6 @@
   "include": [
     "index.ts",
     "gateway-manager.ts",
-    "gateway/**/*.ts",
     "agent/**/*.ts",
     "memory/**/*.ts"
   ],

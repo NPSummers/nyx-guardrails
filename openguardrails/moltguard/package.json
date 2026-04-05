@@ -13,12 +13,12 @@
     }
   },
   "scripts": {
-    "build": "tsc && cp -r gateway dist/gateway",
+    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "typecheck:plugin": "tsc --noEmit -p tsconfig.plugin.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "gateway": "og-gateway"
+    "gateway": "echo 'legacy command removed'"
   },
   "keywords": [
     "openclaw",
@@ -27,7 +27,6 @@
     "security",
     "ai-safety",
     "guard",
-    "ai-security-gateway",
     "data-sanitization",
     "dashboard"
   ],
@@ -47,12 +46,7 @@
   "homepage": "https://github.com/openguardrails/openguardrails/tree/main/moltguard#readme",
   "files": [
     "dist/",
-    "gateway/",
     "dashboard-dist/",
-    "samples/",
-    "scripts/enterprise-enroll.mjs",
-    "scripts/enterprise-unenroll.mjs",
-    "scripts/uninstall.mjs",
     "openclaw.plugin.json",
     "README.md"
   ],
