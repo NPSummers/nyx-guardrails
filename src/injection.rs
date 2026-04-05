@@ -167,53 +167,73 @@ async fn classify_with_model(
     text: &str,
 ) -> Result<Prediction, String> {
     let token = resolve_hf_token(cfg)?;
-    let model_url = format!(
+    let router_model_url = format!(
         "https://router.huggingface.co/hf-inference/models/{}",
         cfg.model.repository
     );
+    let legacy_model_url = format!(
+        "https://api-inference.huggingface.co/models/{}",
+        cfg.model.repository
+    );
 
-    let request = client
-        .post(model_url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "inputs": text,
-            "options": { "wait_for_model": true }
-        }))
-        .timeout(Duration::from_secs(20));
+    let model_urls = [router_model_url, legacy_model_url];
+    let mut last_err: Option<String> = None;
 
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("hf request failed: {}", e))?;
+    for model_url in model_urls {
+        let request = client
+            .post(&model_url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "inputs": text,
+                "options": { "wait_for_model": true }
+            }))
+            .timeout(Duration::from_secs(20));
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("hf status {}: {}", status, body));
-    }
+        let resp = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("hf request failed ({}): {}", model_url, e));
+                continue;
+            }
+        };
 
-    let json = resp
-        .json::<Value>()
-        .await
-        .map_err(|e| format!("hf json parse failed: {}", e))?;
-
-    let preds = parse_predictions(&json)?;
-    let mut best = Prediction {
-        label: cfg.model.label_safe.clone(),
-        score: 0.0,
-    };
-
-    for p in preds {
-        let score = to_injection_score(cfg, &p.label, p.score);
-        if score > best.score {
-            best = Prediction {
-                label: p.label,
-                score,
-            };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let err = format!("hf status {}: {} [{}]", status, body, model_url);
+            // Some models resolve in one HF endpoint but not the other.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                last_err = Some(err);
+                continue;
+            }
+            return Err(err);
         }
+
+        let json = resp
+            .json::<Value>()
+            .await
+            .map_err(|e| format!("hf json parse failed: {}", e))?;
+
+        let preds = parse_predictions(&json)?;
+        let mut best = Prediction {
+            label: cfg.model.label_safe.clone(),
+            score: 0.0,
+        };
+
+        for p in preds {
+            let score = to_injection_score(cfg, &p.label, p.score);
+            if score > best.score {
+                best = Prediction {
+                    label: p.label,
+                    score,
+                };
+            }
+        }
+
+        return Ok(best);
     }
 
-    Ok(best)
+    Err(last_err.unwrap_or_else(|| "hf request failed: no usable endpoint".to_string()))
 }
 
 fn resolve_hf_token(cfg: &AntiPromptInjectionConfig) -> Result<String, String> {
