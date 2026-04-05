@@ -1086,7 +1086,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_status",
       description: "Show nyx-guardrails status, API key, and quota",
-      requireAuth: true,
+      requireAuth: false,
       handler: async () => {
         const creds = globalCoreCredentials;
 
@@ -1135,7 +1135,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_config",
       description: "Show how to configure API key for cross-machine sharing",
-      requireAuth: true,
+      requireAuth: false,
       handler: async () => {
         // Show configuration instructions
         // Note: OpenClaw commands don't support arguments directly.
@@ -1177,7 +1177,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_core",
       description: "Open Core portal for account and billing",
-      requireAuth: true,
+      requireAuth: false,
       handler: async () => {
         return {
           text: [
@@ -1196,7 +1196,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_dashboard",
       description: "Start local Dashboard and get access URLs",
-      requireAuth: true,
+      requireAuth: false,
       handler: async () => {
         if (!globalCoreCredentials) {
           return {
@@ -1243,7 +1243,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_claim",
       description: "Display agent ID and API key for claiming on Core",
-      requireAuth: true,
+      requireAuth: false,
       handler: async () => {
         if (!globalCoreCredentials) {
           return {
@@ -1296,7 +1296,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_sanitize",
       description: "Enable/disable Nyx provider routing for sanitization",
-      requireAuth: true,
+      requireAuth: false,
       acceptsArgs: true,
       handler: async (ctx) => {
         const command = ctx.args?.trim().toLowerCase();
@@ -1408,7 +1408,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_scan",
       description: "Scan workspace files for security risks (skills, plugins, memories, workspace md files)",
-      requireAuth: true,
+      requireAuth: false,
       acceptsArgs: true,
       handler: async (ctx) => {
         if (!globalCoreCredentials) {
@@ -1713,7 +1713,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_autoscan",
       description: "Enable/disable automatic file scanning on workspace changes",
-      requireAuth: true,
+      requireAuth: false,
       acceptsArgs: true,
       handler: async (ctx) => {
         const command = ctx.args?.trim().toLowerCase();
@@ -1882,7 +1882,7 @@ const openClawGuardPlugin = {
     api.registerCommand({
       name: "nyx_reset",
       description: "Reset nyx-guardrails and re-register with Core (gets new API key)",
-      requireAuth: true,
+      requireAuth: false,
       handler: async () => {
         const hadCredentials = globalCoreCredentials !== null;
         const oldAgentId = globalCoreCredentials?.agentId;
